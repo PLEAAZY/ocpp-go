@@ -253,6 +253,9 @@ type WsServer interface {
 	// Addr gives the address on which the server is listening, useful if, for
 	// example, the port is system-defined (set to 0).
 	Addr() *net.TCPAddr
+
+	// GetConnectionIds returns the IDs of all active websocket connections.
+	GetConnectionIds() []string
 }
 
 // Default implementation of a Websocket server.
@@ -677,6 +680,18 @@ func (server *Server) cleanupConnection(ws *WebSocket) {
 	if server.disconnectedHandler != nil {
 		server.disconnectedHandler(ws)
 	}
+}
+
+func (server *Server) GetConnectionIds() []string {
+	server.connMutex.RLock()
+	defer server.connMutex.RUnlock()
+
+	ids := make([]string, 0, len(server.connections))
+	for id := range server.connections {
+		ids = append(ids, id)
+	}
+
+	return ids
 }
 
 // ---------------------- CLIENT ----------------------
