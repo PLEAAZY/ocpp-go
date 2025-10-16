@@ -177,6 +177,8 @@ func (f *FIFOQueueMap) Add(clientID string, queue RequestQueue) {
 }
 
 func (f *FIFOQueueMap) Size() int {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
 	return len(f.data)
 }
 
