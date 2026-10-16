@@ -1238,3 +1238,74 @@ func createTLSCertificate(certificateFilename string, keyFilename string, cn str
 	}
 	return nil
 }
+
+func TestForwardedClientAddr(t *testing.T) {
+	tests := []struct {
+		name       string
+		realIP     string
+		forwarded  string
+		want       string
+		wantAbsent bool
+	}{
+		{name: "real ip", realIP: "203.0.113.10", forwarded: "198.51.100.20, 203.0.113.10", want: "203.0.113.10"},
+		{name: "real ip with port", realIP: "203.0.113.10:54321", want: "203.0.113.10"},
+		{name: "ipv6 real ip", realIP: "2001:db8::1", want: "2001:db8::1"},
+		{name: "forwarded for rightmost", forwarded: "198.51.100.20, 203.0.113.10", want: "203.0.113.10"},
+		{name: "forwarded for skips unknown", forwarded: "198.51.100.20, unknown", want: "198.51.100.20"},
+		{name: "invalid real ip falls through", realIP: "not-an-ip", forwarded: "203.0.113.10", want: "203.0.113.10"},
+		{name: "absent", wantAbsent: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &http.Request{Header: http.Header{}}
+			if tt.realIP != "" {
+				req.Header.Set("X-Real-Ip", tt.realIP)
+			}
+			if tt.forwarded != "" {
+				req.Header.Set("X-Forwarded-For", tt.forwarded)
+			}
+
+			got := forwardedClientAddr(req)
+			if tt.wantAbsent {
+				assert.Nil(t, got)
+				return
+			}
+
+			require.NotNil(t, got)
+			assert.Equal(t, tt.want, got.String())
+		})
+	}
+}
+
+func TestServerRemoteAddrUsesForwardedClientIP(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	require.NoError(t, ln.Close())
+
+	connected := make(chan string, 1)
+	wsServer := newWebsocketServer(t, nil)
+	wsServer.SetNewClientHandler(func(ws Channel) {
+		connected <- ws.RemoteAddr().String()
+	})
+
+	go wsServer.Start(port, serverPath)
+	time.Sleep(200 * time.Millisecond)
+	t.Cleanup(wsServer.Stop)
+
+	wsClient := newWebsocketClient(t, nil)
+	wsClient.SetHeaderValue("X-Real-Ip", "203.0.113.10")
+	wsClient.SetHeaderValue("X-Forwarded-For", "198.51.100.20, 203.0.113.10")
+
+	u := url.URL{Scheme: "ws", Host: fmt.Sprintf("127.0.0.1:%d", port), Path: testPath}
+	require.NoError(t, wsClient.Start(u.String()))
+	t.Cleanup(wsClient.Stop)
+
+	select {
+	case got := <-connected:
+		assert.Equal(t, "203.0.113.10", got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for charge point connection")
+	}
+}

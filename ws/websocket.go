@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -124,6 +125,7 @@ type Channel interface {
 type WebSocket struct {
 	connection         *websocket.Conn
 	id                 string
+	remoteAddr         net.Addr
 	outQueue           chan []byte
 	closeC             chan websocket.CloseError // used to gracefully close a websocket connection.
 	forceCloseC        chan error                // used by the readPump to notify a forcefully closed connection to the writePump.
@@ -137,7 +139,13 @@ func (websocket *WebSocket) ID() string {
 }
 
 // Returns the address of the remote peer.
+// On a server connection behind a reverse proxy this is the client address from
+// the upgrade request, not the proxy's TCP address.
 func (websocket *WebSocket) RemoteAddr() net.Addr {
+	if websocket.remoteAddr != nil {
+		return websocket.remoteAddr
+	}
+
 	return websocket.connection.RemoteAddr()
 }
 
@@ -469,11 +477,87 @@ func (server *Server) Write(webSocketId string, data []byte) error {
 	return nil
 }
 
+// ipOnlyAddr is the client IP taken from a proxy header. Those headers do not
+// include the charge point's source port, and the port on this TCP connection
+// belongs to the reverse proxy.
+type ipOnlyAddr struct {
+	ip string
+}
+
+func (a ipOnlyAddr) Network() string { return "ip" }
+
+func (a ipOnlyAddr) String() string { return a.ip }
+
+// forwardedClientAddr returns the charge point address supplied by a reverse
+// proxy. Traefik sets X-Real-Ip from the connection it accepted. X-Forwarded-For
+// is used only when that header is absent, and then only its rightmost hop,
+// which is the address the immediate proxy appended.
+func forwardedClientAddr(r *http.Request) net.Addr {
+	if ip := headerIP(r.Header.Get("X-Real-Ip"), false); ip != "" {
+		return ipOnlyAddr{ip: ip}
+	}
+
+	if ip := headerIP(strings.Join(r.Header.Values("X-Forwarded-For"), ","), true); ip != "" {
+		return ipOnlyAddr{ip: ip}
+	}
+
+	return nil
+}
+
+func headerIP(value string, last bool) string {
+	parts := strings.Split(value, ",")
+	if last {
+		for i := len(parts) - 1; i >= 0; i-- {
+			if ip := canonicalIP(parts[i]); ip != "" {
+				return ip
+			}
+		}
+
+		return ""
+	}
+
+	for _, part := range parts {
+		if ip := canonicalIP(part); ip != "" {
+			return ip
+		}
+	}
+
+	return ""
+}
+
+func canonicalIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.EqualFold(value, "unknown") {
+		return ""
+	}
+
+	if ip := net.ParseIP(value); ip != nil {
+		return ip.String()
+	}
+
+	host, _, err := net.SplitHostPort(value)
+	if err != nil {
+		return ""
+	}
+
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil {
+		return ""
+	}
+
+	return ip.String()
+}
+
 func (server *Server) wsHandler(w http.ResponseWriter, r *http.Request) {
 	responseHeader := http.Header{}
 	url := r.URL
 	id := path.Base(url.Path)
-	log.Debugf("handling new connection for %s from %s", id, r.RemoteAddr)
+	clientAddr := forwardedClientAddr(r)
+	peer := r.RemoteAddr
+	if clientAddr != nil {
+		peer = clientAddr.String()
+	}
+	log.Debugf("handling new connection for %s from %s", id, peer)
 	// Negotiate sub-protocol
 	clientSubprotocols := websocket.Subprotocols(r)
 	negotiatedSuprotocol := ""
@@ -526,16 +610,21 @@ out:
 	}
 
 	// The id of the charge point is the final path element
+	remoteAddr := conn.RemoteAddr()
+	if clientAddr != nil {
+		remoteAddr = clientAddr
+	}
 	ws := WebSocket{
 		connection:         conn,
 		id:                 id,
+		remoteAddr:         remoteAddr,
 		outQueue:           make(chan []byte, 1),
 		closeC:             make(chan websocket.CloseError, 1),
 		forceCloseC:        make(chan error, 1),
 		pingMessage:        make(chan []byte, 1),
 		tlsConnectionState: r.TLS,
 	}
-	log.Debugf("upgraded websocket connection for %s from %s", id, conn.RemoteAddr().String())
+	log.Debugf("upgraded websocket connection for %s from %s", id, remoteAddr.String())
 	// If unsupported subprotocol, terminate the connection immediately
 	if negotiatedSuprotocol == "" {
 		server.error(fmt.Errorf("unsupported subprotocols %v for new client %v (%v)", clientSubprotocols, id, r.RemoteAddr))
