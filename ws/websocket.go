@@ -497,7 +497,7 @@ func forwardedClientAddr(r *http.Request) net.Addr {
 		return ipOnlyAddr{ip: ip}
 	}
 
-	if ip := headerIP(r.Header.Get("X-Forwarded-For"), true); ip != "" {
+	if ip := headerIP(strings.Join(r.Header.Values("X-Forwarded-For"), ","), true); ip != "" {
 		return ipOnlyAddr{ip: ip}
 	}
 
